@@ -30,9 +30,6 @@ except ImportError:
     HAS_YAML = False
 from pathlib import Path
 from datetime import datetime
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-import threading
 
 try:
     import fitz  # PyMuPDF
@@ -42,12 +39,15 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from PIL import Image, ImageTk
+    from PIL import Image
     HAS_PILLOW = True
 except ImportError:
     Image = None
-    ImageTk = None
     HAS_PILLOW = False
+
+# Project folder: converted .md files and images go here by default
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "converted"
 
 
 # ─────────────────────────────────────────────
@@ -218,13 +218,16 @@ class ImageExtractor:
                     # Resize if needed
                     ImageExtractor.resize_image(str(img_path))
                     
-                    # Get position
+                    # Get position and dimensions (PDF points: 72 pt = 1 in)
                     img_rects = page.get_image_rects(xref)
-                    img_top = img_rects[0].y0 if img_rects else 0
-                    
-                    # Create markdown reference
+                    if not img_rects:
+                        continue
+                    r = img_rects[0]
+                    img_top = r.y0
+                    w_in = r.width / 72.0
+                    h_in = r.height / 72.0
                     rel_path = f"images/{img_name}".replace("\\", "/")
-                    md_ref = f"![Image]({rel_path})"
+                    md_ref = f'<img src="{rel_path}" style="width:{w_in:.2f}in;height:{h_in:.2f}in" />'
                     images.append((md_ref, img_top))
                     
                 except Exception as e:
@@ -274,6 +277,12 @@ class TableExtractor:
         return tables
     
     @staticmethod
+    def _escape_cell(cell: str) -> str:
+        """Escape pipe and newlines so Markdown table does not break."""
+        s = str(cell).strip().replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+        return s
+
+    @staticmethod
     def to_markdown(data: list[list]) -> str:
         """Convert table data to Markdown"""
         if not data or len(data) == 0:
@@ -284,13 +293,13 @@ class TableExtractor:
         rows = data[1:] if len(data) > 1 else []
         
         lines = []
-        lines.append("| " + " | ".join(str(h).strip() for h in header) + " |")
+        lines.append("| " + " | ".join(TableExtractor._escape_cell(h) for h in header) + " |")
         lines.append("| " + " | ".join(separator) + " |")
         
         for row in rows:
             while len(row) < len(header):
                 row.append("")
-            lines.append("| " + " | ".join(str(c).strip() for c in row[:len(header)]) + " |")
+            lines.append("| " + " | ".join(TableExtractor._escape_cell(c) for c in row[:len(header)]) + " |")
         
         return "\n".join(lines)
 
@@ -300,30 +309,29 @@ class DrawingExtractor:
     
     @staticmethod
     def find_horizontal_rules(page) -> list[float]:
-        """Find horizontal rules (dividers)"""
+        """Find only clear full-width horizontal rules; skip decorative lines."""
         rules = []
-        
         try:
+            try:
+                page_width = page.rect.width
+            except Exception:
+                page_width = 612  # default
+            min_width = max(200, page_width * 0.6)  # at least 60% of page width
             for path in page.get_drawings():
                 try:
                     rect = path.get("rect")
                     if not rect:
                         continue
-                    
                     width = rect[2] - rect[0]
                     height = rect[3] - rect[1]
-                    
-                    # Wide and thin = horizontal rule
-                    if width > 200 and height < 3:
+                    # Only full-width thin lines (real dividers), not decorative
+                    if width >= min_width and 0 < height < 4:
                         y_pos = rect[1]
                         rules.append(y_pos)
-                
-                except Exception as e:
+                except Exception:
                     pass
-        
         except Exception as e:
             print(f"  [warn] Could not extract drawings: {e}")
-        
         return sorted(rules)
 
 
@@ -364,6 +372,53 @@ class AnnotationExtractor:
             print(f"  [warn] Could not extract annotations: {e}")
         
         return annotations
+
+
+def _rect_overlap(r1, r2) -> bool:
+    """True if two rects (x0, y0, x1, y1) overlap."""
+    try:
+        x0_1, y0_1, x1_1, y1_1 = r1[0], r1[1], r1[2], r1[3]
+        x0_2, y0_2, x1_2, y1_2 = r2[0], r2[1], r2[2], r2[3]
+    except (IndexError, TypeError):
+        return False
+    if x1_1 < x0_2 or x0_1 > x1_2 or y1_1 < y0_2 or y0_1 > y1_2:
+        return False
+    return True
+
+
+class LinkExtractor:
+    """Extract clickable hyperlinks from PDF and support inlining with display text."""
+
+    @staticmethod
+    def extract_all(page) -> list[tuple[str, float]]:
+        """Return (markdown_link, y_pos) for standalone link elements (legacy)."""
+        out = []
+        for _rect, uri, y_pos in LinkExtractor.extract_with_rects(page):
+            text = uri if len(uri) <= 60 else (uri[:57] + "...")
+            out.append((f"[{text}]({uri})", y_pos))
+        return out
+
+    @staticmethod
+    def extract_with_rects(page) -> list[tuple[tuple, str, float]]:
+        """Return list of (rect, uri, y_pos) for matching text to links. rect = (x0,y0,x1,y1)."""
+        links = []
+        try:
+            for link in page.get_links():
+                uri = link.get("uri") or link.get("file")
+                if not uri:
+                    continue
+                rect = link.get("from")
+                if not rect:
+                    continue
+                try:
+                    r = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+                except (IndexError, TypeError, ValueError):
+                    continue
+                y_pos = r[1]
+                links.append((r, uri, y_pos))
+        except Exception as e:
+            print(f"  [warn] Could not extract links: {e}")
+        return links
 
 
 class BookmarkExtractor:
@@ -502,72 +557,103 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     """Convert a single page to Markdown"""
     md_lines = []
     
-    # Page header
-    md_lines.append(f"## 📄 Page {page_num}\n")
-    
     avg_font_size = HeadingDetector.get_average_font_size(page)
     
     # Extract elements
     images = ImageExtractor.extract_all(page, page_num, image_dir) if image_dir else []
     tables = TableExtractor.extract_all(page)
     annotations = AnnotationExtractor.extract_all(page)
-    horiz_rules = DrawingExtractor.find_horizontal_rules(page)
+    links_with_rects = LinkExtractor.extract_with_rects(page)  # (rect, uri, y_pos)
     
     # Get text content
     text_dict = page.get_text("dict")
     blocks = text_dict.get("blocks", [])
     
+    # Track which links we inlined as [display text](url) so we don't emit them again as standalone
+    inlined_link_indices = set()
+    
     # Track all elements by position for proper ordering
     elements = []  # (y_position, type, content)
     
-    # Add tables
+    # ---- 1) Build text elements: span-level link matching so "Label: [Display Text](url)" is correct ----
+    for block in blocks:
+        if block["type"] != 0:  # skip non-text blocks
+            continue
+        block_y = block.get("bbox", [0, 0, 0, 0])[1]
+        
+        for line in block.get("lines", []):
+            line_spans = line.get("spans", [])
+            if not line_spans:
+                continue
+            
+            max_font_size = 0
+            is_line_bold = False
+            line_parts = []  # mix of plain text and "[text](url)" per span
+            
+            for span in line_spans:
+                span_text = span.get("text", "")
+                formatted = TextFormatter.apply_formatting(span)
+                span_size = span.get("size", 0)
+                if span_size > max_font_size:
+                    max_font_size = span_size
+                if span.get("flags", 0) & 16:
+                    is_line_bold = True
+                
+                # Span bbox for link matching (each link covers a phrase, not the whole line)
+                span_bbox = span.get("bbox") or span.get("origin")
+                if span_bbox is not None:
+                    try:
+                        if len(span_bbox) >= 4:
+                            span_bbox = (float(span_bbox[0]), float(span_bbox[1]), float(span_bbox[2]), float(span_bbox[3]))
+                        elif len(span_bbox) >= 2:
+                            # origin only (x,y) — use tiny rect around it
+                            x, y = float(span_bbox[0]), float(span_bbox[1])
+                            span_bbox = (x, y, x + 1, y + 1)
+                        else:
+                            span_bbox = (0, 0, 0, 0)
+                    except (TypeError, ValueError):
+                        span_bbox = (0, 0, 0, 0)
+                else:
+                    span_bbox = (0, 0, 0, 0)
+                
+                # Does this span overlap a link? If yes, emit [display text](url)
+                matched_link_idx = None
+                for idx, (link_rect, uri, _) in enumerate(links_with_rects):
+                    if idx in inlined_link_indices:
+                        continue
+                    if _rect_overlap(link_rect, span_bbox):
+                        matched_link_idx = idx
+                        break
+                
+                if matched_link_idx is not None and formatted.strip():
+                    line_parts.append(f"[{formatted.strip()}]({links_with_rects[matched_link_idx][1]})")
+                    inlined_link_indices.add(matched_link_idx)
+                else:
+                    line_parts.append(formatted)
+            
+            line_text = "".join(line_parts).strip()
+            if not line_text:
+                continue
+            
+            elements.append((block_y, "text", line_text, max_font_size, is_line_bold))
+    
+    # ---- 2) Add non-text elements ----
     for table_md, table_y in tables:
         elements.append((table_y, "table", table_md))
     
-    # Add images
     for img_md, img_y in images:
         elements.append((img_y, "image", img_md))
     
-    # Add annotations
     for annot_md, annot_y in annotations:
         elements.append((annot_y, "annotation", annot_md))
     
-    # Add horizontal rules
-    for rule_y in horiz_rules:
-        elements.append((rule_y, "rule", "---"))
-    
-    # Add text blocks
-    for block in blocks:
-        if block["type"] == 0:  # Text block
-            block_y = block.get("bbox", [0, 0, 0, 0])[1]
-            
-            for line in block.get("lines", []):
-                line_text = ""
-                line_spans = line.get("spans", [])
-                
-                if not line_spans:
-                    continue
-                
-                # Track font info for heading detection
-                max_font_size = 0
-                is_line_bold = False
-                
-                # Build line with formatting
-                for span in line_spans:
-                    text = span.get("text", "")
-                    formatted = TextFormatter.apply_formatting(span)
-                    line_text += formatted
-                    
-                    # Track the dominant font size and bold flag
-                    span_size = span.get("size", 0)
-                    if span_size > max_font_size:
-                        max_font_size = span_size
-                    if span.get("flags", 0) & 16:  # bold flag
-                        is_line_bold = True
-                
-                line_text = line_text.strip()
-                if line_text:
-                    elements.append((block_y, "text", line_text, max_font_size, is_line_bold))
+    # Only add links that were NOT inlined (no display text); skip duplicate URIs
+    inlined_uris = {links_with_rects[i][1] for i in inlined_link_indices}
+    for idx, (_rect, uri, link_y) in enumerate(links_with_rects):
+        if idx not in inlined_link_indices and uri not in inlined_uris:
+            text = uri if len(uri) <= 60 else (uri[:57] + "...")
+            elements.append((link_y, "link", f"[{text}]({uri})"))
+            inlined_uris.add(uri)  # avoid duplicate standalone for same URL
     
     # Sort by position and process
     elements.sort(key=lambda x: x[0])
@@ -603,13 +689,13 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
             md_lines.append(f"\n{content}\n")
         
         elif elem_type == "image":
-            md_lines.append(f"\n{content}\n")
+            md_lines.append(content)
         
         elif elem_type == "annotation":
             md_lines.append(f"\n{content}\n")
         
-        elif elem_type == "rule":
-            md_lines.append("\n---\n")
+        elif elem_type == "link":
+            md_lines.append(content)
         
         prev_y = y_pos
     
@@ -647,11 +733,6 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
         metadata = PDFMetadataExtractor.extract(doc)
         md_content.append(create_frontmatter(metadata))
         
-        # Extract bookmarks
-        bookmarks = BookmarkExtractor.extract(doc)
-        if bookmarks:
-            md_content.append(bookmarks)
-        
         # Process pages
         print(f"📄 Processing {len(doc)} pages...")
         
@@ -669,11 +750,6 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
         if embedded:
             md_content.append(embedded)
         
-        # Add security info
-        security = SecurityHandler.get_permissions_info(doc)
-        if security:
-            md_content.append(security)
-        
         doc.close()
     
     except Exception as e:
@@ -689,425 +765,6 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
         print(f"✅ Saved: {output_path}")
     
     return result
-
-
-# ─────────────────────────────────────────────
-# GUI
-# ─────────────────────────────────────────────
-
-class ComprehensivePDFtoMDGUI:
-    """Full-featured GUI for PDF conversion"""
-    
-    def __init__(self, root):
-        self.root = root
-        self.root.title("🚀 Comprehensive PDF to Markdown Converter")
-        self.root.geometry("800x1600")
-        self.root.resizable(True, True)
-        
-        self.pdf_path = tk.StringVar()
-        self.output_path = tk.StringVar()
-        self.image_dir = tk.StringVar()
-        self.password = tk.StringVar()
-        self.extract_images = tk.BooleanVar(value=True)
-        
-        self.setup_ui()
-    
-    def setup_ui(self):
-        """Create GUI"""
-        # Title
-        title_frame = tk.Frame(self.root, bg="#2c3e50")
-        title_frame.pack(fill=tk.X, padx=0, pady=0)
-        title_label = tk.Label(
-            title_frame,
-            text="🚀 Comprehensive PDF to Markdown Converter\nFully-Featured Edition",
-            font=("Arial", 14, "bold"),
-            bg="#2c3e50",
-            fg="white",
-            pady=15,
-            justify=tk.CENTER
-        )
-        title_label.pack()
-        
-        # Create scrollable main area
-        canvas = tk.Canvas(self.root, highlightthickness=0)
-        scrollbar = tk.Scrollbar(self.root, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Bind mousewheel
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        
-        canvas.pack(side="left", fill=tk.BOTH, expand=True)
-        scrollbar.pack(side="right", fill=tk.Y)
-        
-        # Main frame inside scrollable area
-        main_frame = tk.Frame(scrollable_frame)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # --- PDF Selection ---
-        tk.Label(main_frame, text="📄 SELECT PDF", font=("Arial", 11, "bold")).pack(anchor=tk.W)
-        pdf_frame = tk.Frame(main_frame)
-        pdf_frame.pack(fill=tk.X, pady=(5, 15))
-        tk.Entry(pdf_frame, textvariable=self.pdf_path, state="readonly", width=60).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(pdf_frame, text="Browse", command=self.browse_pdf, width=10).pack(side=tk.LEFT, padx=(10, 0))
-        
-        # --- Output ---
-        output_label_frame = tk.Frame(main_frame)
-        output_label_frame.pack(anchor=tk.W, pady=(10, 0))
-        tk.Label(output_label_frame, text="📁 OUTPUT FILE (Optional)", font=("Arial", 11, "bold")).pack(side=tk.LEFT)
-        tk.Label(output_label_frame, text="- Auto-generates filename if not specified", font=("Arial", 9, "italic"), fg="gray").pack(side=tk.LEFT, padx=(10, 0))
-        
-        out_frame = tk.Frame(main_frame)
-        out_frame.pack(fill=tk.X, pady=(5, 15))
-        tk.Entry(out_frame, textvariable=self.output_path, width=60).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Button(out_frame, text="Browse", command=self.browse_output, width=10).pack(side=tk.LEFT, padx=(10, 0))
-        
-        # --- Images ---
-        img_frame = tk.LabelFrame(main_frame, text="🖼️  IMAGE EXTRACTION", font=("Arial", 10, "bold"), padx=10, pady=10)
-        img_frame.pack(fill=tk.X, pady=10)
-        
-        tk.Checkbutton(img_frame, text="Extract images from PDF", variable=self.extract_images, 
-                      command=self.toggle_image_dir, font=("Arial", 10)).pack(anchor=tk.W)
-        
-        tk.Label(img_frame, text="Image folder:", font=("Arial", 9)).pack(anchor=tk.W, pady=(5, 0))
-        img_path_frame = tk.Frame(img_frame)
-        img_path_frame.pack(fill=tk.X, pady=5)
-        tk.Entry(img_path_frame, textvariable=self.image_dir, state="disabled", width=50).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.img_browse_btn = tk.Button(img_path_frame, text="Browse", command=self.browse_image_dir, width=10, state="disabled")
-        self.img_browse_btn.pack(side=tk.LEFT, padx=(5, 0))
-        
-        # --- Security ---
-        sec_frame = tk.LabelFrame(main_frame, text="🔐 SECURITY", font=("Arial", 10, "bold"), padx=10, pady=10)
-        sec_frame.pack(fill=tk.X, pady=10)
-        
-        tk.Label(sec_frame, text="Password (if PDF is protected):", font=("Arial", 9)).pack(anchor=tk.W)
-        tk.Entry(sec_frame, textvariable=self.password, show="*", width=50).pack(anchor=tk.W, fill=tk.X, pady=5)
-        
-        # --- Features ---
-        feat_frame = tk.LabelFrame(main_frame, text="✨ FEATURES EXTRACTED", font=("Arial", 10, "bold"), padx=10, pady=10)
-        feat_frame.pack(fill=tk.X, pady=10)
-        
-        features = [
-            "✅ Text (with bold, italic formatting)",
-            "✅ Headings (h1-h3 auto-detection)",
-            "✅ Lists (bullets & numbered)",
-            "✅ Hyperlinks & URLs",
-            "✅ Images (extracted & embedded)",
-            "✅ Tables (properly formatted)",
-            "✅ Vector graphics (rules/dividers)",
-            "✅ Annotations (comments & highlights)",
-            "✅ Bookmarks (table of contents)",
-            "✅ Metadata (YAML frontmatter)",
-            "✅ Embedded files (referenced)",
-            "✅ Security info (permissions)"
-        ]
-        
-        for feat in features:
-            tk.Label(feat_frame, text=feat, font=("Arial", 9), justify=tk.LEFT).pack(anchor=tk.W)
-        
-        # --- Convert Button ---
-        convert_btn = tk.Button(main_frame, text="🚀 CONVERT NOW", command=self.convert,
-                               bg="#27ae60", fg="white", font=("Arial", 12, "bold"),
-                               padx=40, pady=15)
-        convert_btn.pack(pady=20)
-        
-        # --- Status ---
-        tk.Label(main_frame, text="Status Output:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
-        self.status_text = scrolledtext.ScrolledText(main_frame, height=15, width=100,
-                                                    font=("Courier", 8), state=tk.DISABLED)
-        self.status_text.pack(fill=tk.BOTH, expand=True, pady=10)
-        
-        # --- Buttons ---
-        btn_frame = tk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X)
-        tk.Button(btn_frame, text="Clear", command=self.clear_status, width=10).pack(side=tk.LEFT, padx=5)
-        tk.Button(btn_frame, text="Exit", command=self.root.quit, width=10).pack(side=tk.RIGHT, padx=5)
-    
-    def toggle_image_dir(self):
-        if self.extract_images.get():
-            self.img_browse_btn.config(state=tk.NORMAL)
-            # Auto-set to default images folder if not set
-            if not self.image_dir.get():
-                default_dir = str(Path.home() / "Downloads" / "pdf_images")
-                self.image_dir.set(default_dir)
-                self.log(f"✓ Default images folder: {default_dir}")
-        else:
-            self.img_browse_btn.config(state=tk.DISABLED)
-            self.image_dir.set("")
-    
-    def browse_pdf(self):
-        file_path = filedialog.askopenfilename(title="Select PDF", filetypes=[("PDF Files", "*.pdf")])
-        if file_path:
-            self.pdf_path.set(file_path)
-            self.log(f"✓ PDF: {Path(file_path).name}")
-    
-    def browse_output(self):
-        file_path = filedialog.asksaveasfilename(title="Save Markdown", defaultextension=".md",
-                                                filetypes=[("Markdown", "*.md"), ("Text", "*.txt")])
-        if file_path:
-            self.output_path.set(file_path)
-            self.log(f"✓ Output: {Path(file_path).name}")
-    
-    def browse_image_dir(self):
-        dir_path = filedialog.askdirectory(title="Image Folder")
-        if dir_path:
-            self.image_dir.set(dir_path)
-            self.log(f"✓ Images: {Path(dir_path).name}")
-    
-    def log(self, message: str):
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.insert(tk.END, message + "\n")
-        self.status_text.see(tk.END)
-        self.status_text.config(state=tk.DISABLED)
-        self.root.update()
-    
-    def clear_status(self):
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.delete(1.0, tk.END)
-        self.status_text.config(state=tk.DISABLED)
-    
-    def convert(self):
-        if not self.pdf_path.get():
-            messagebox.showerror("Error", "Select a PDF file!")
-            return
-        
-        if self.extract_images.get() and not self.image_dir.get():
-            messagebox.showerror("Error", "Select image folder!")
-            return
-        
-        thread = threading.Thread(target=self._convert_thread)
-        thread.start()
-    
-    def _convert_thread(self):
-        try:
-            pdf_path = self.pdf_path.get()
-            output_path = self.output_path.get() or str(Path(pdf_path).with_suffix(".md"))
-            image_dir = self.image_dir.get() if self.extract_images.get() else None
-            password = self.password.get() or None
-            
-            self.log(f"\n🚀 Converting: {Path(pdf_path).name}...")
-            self.log("=" * 60)
-            
-            markdown = pdf_to_markdown(pdf_path, output_path, image_dir, password)
-            
-            self.log("=" * 60)
-            self.log(f"✅ Success! {len(markdown)} characters")
-            self.log(f"📁 Saved: {output_path}")
-            
-            if image_dir:
-                img_count = len(list(Path(image_dir).glob("*.png"))) + len(list(Path(image_dir).glob("*.jpg")))
-                self.log(f"🖼️  Extracted {img_count} images")
-            
-            self.root.after(0, lambda: self._ask_view(output_path, markdown, image_dir))
-        
-        except Exception as e:
-            self.log(f"\n❌ ERROR: {str(e)}")
-    
-    def _ask_view(self, output_path: str, markdown: str, image_dir: str = None):
-        response = messagebox.askyesno("Success", f"Saved to:\n{output_path}\n\nView output?")
-        if response:
-            self._show_preview(markdown, output_path, image_dir)
-    
-    def _show_preview(self, markdown: str, output_path: str = None, image_dir: str = None):
-        preview = tk.Toplevel(self.root)
-        preview.title("📄 Markdown Preview - Complete Preview")
-        preview.geometry("1000x700")
-        
-        # Create scrollable canvas
-        canvas = tk.Canvas(preview, highlightthickness=0, bg="white")
-        scrollbar = tk.Scrollbar(preview, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="white")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Bind mousewheel
-        def _on_mousewheel(event):
-            try:
-                canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-            except:
-                pass  # Ignore if canvas is destroyed
-        
-        canvas.bind("<MouseWheel>", _on_mousewheel)
-        
-        canvas.pack(side="left", fill=tk.BOTH, expand=True)
-        scrollbar.pack(side="right", fill=tk.Y)
-        
-        # Determine base directory for resolving relative image paths
-        base_dir = Path.cwd()
-        if image_dir:
-            base_dir = Path(image_dir).parent
-        elif output_path:
-            base_dir = Path(output_path).parent
-        
-        # Parse and render markdown
-        lines = markdown.split("\n")
-        image_pattern = re.compile(r"!\[.*?\]\((.*?)\)")
-        
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-            
-            if not line_stripped:
-                tk.Label(scrollable_frame, text="", bg="white").pack(anchor=tk.W, pady=5)
-                continue
-            
-            # Headings
-            if line_stripped.startswith("# "):
-                text = line_stripped[2:].strip()
-                lbl = tk.Label(
-                    scrollable_frame,
-                    text=text,
-                    font=("Arial", 20, "bold"),
-                    fg="#1a5490",
-                    bg="white",
-                    wraplength=900,
-                    justify=tk.LEFT
-                )
-                lbl.pack(anchor=tk.W, padx=20, pady=(15, 5))
-            
-            elif line_stripped.startswith("## "):
-                text = line_stripped[3:].strip()
-                lbl = tk.Label(
-                    scrollable_frame,
-                    text=text,
-                    font=("Arial", 16, "bold"),
-                    fg="#2471a3",
-                    bg="white",
-                    wraplength=900,
-                    justify=tk.LEFT
-                )
-                lbl.pack(anchor=tk.W, padx=20, pady=(12, 5))
-            
-            elif line_stripped.startswith("### "):
-                text = line_stripped[4:].strip()
-                lbl = tk.Label(
-                    scrollable_frame,
-                    text=text,
-                    font=("Arial", 13, "bold"),
-                    fg="#3498db",
-                    bg="white",
-                    wraplength=900,
-                    justify=tk.LEFT
-                )
-                lbl.pack(anchor=tk.W, padx=20, pady=(10, 3))
-            
-            # Images
-            elif "![" in line_stripped and "](" in line_stripped:
-                match = image_pattern.search(line_stripped)
-                if match:
-                    img_path = match.group(1)
-                    try:
-                        full_img_path = Path(img_path)
-                        if not full_img_path.is_absolute():
-                            # Try to resolve relative to base directory
-                            full_img_path = base_dir / img_path
-                        
-                        if full_img_path.exists():
-                            img = Image.open(full_img_path)
-                            img.thumbnail((900, 500), Image.Resampling.LANCZOS)
-                            photo = ImageTk.PhotoImage(img)
-                            
-                            img_lbl = tk.Label(
-                                scrollable_frame,
-                                image=photo,
-                                bg="white",
-                                bd=1,
-                                relief=tk.SUNKEN
-                            )
-                            img_lbl.image = photo
-                            img_lbl.pack(anchor=tk.CENTER, padx=20, pady=10)
-                        else:
-                            tk.Label(
-                                scrollable_frame,
-                                text=f"🖼️  Image: {img_path}",
-                                font=("Arial", 10, "italic"),
-                                fg="gray",
-                                bg="#f0f0f0",
-                                wraplength=900
-                            ).pack(anchor=tk.W, padx=20, pady=5, fill=tk.X)
-                    except Exception as e:
-                        tk.Label(
-                            scrollable_frame,
-                            text=f"📷 [Image: {Path(img_path).name}]",
-                            font=("Arial", 9),
-                            fg="gray",
-                            bg="#f0f0f0"
-                        ).pack(anchor=tk.W, padx=20, pady=5, fill=tk.X)
-            
-            # Tables
-            elif line_stripped.startswith("|"):
-                cells = [cell.strip() for cell in line_stripped.split("|")]
-                cells = [c for c in cells if c]
-                
-                if cells:
-                    row_frame = tk.Frame(scrollable_frame, bg="white")
-                    row_frame.pack(anchor=tk.W, padx=20, pady=2, fill=tk.X)
-                    
-                    for cell in cells:
-                        if cell == "---":
-                            continue
-                        cell_lbl = tk.Label(
-                            row_frame,
-                            text=cell,
-                            font=("Arial", 9),
-                            bg="#f8f9f9",
-                            fg="#2c3e50",
-                            padx=10,
-                            pady=5,
-                            relief=tk.RIDGE,
-                            bd=1
-                        )
-                        cell_lbl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-            
-            # Lists
-            elif line_stripped.startswith("- ") or line_stripped.startswith("* "):
-                text = line_stripped[2:].strip()
-                indent = len(line) - len(line.lstrip())
-                tk.Label(
-                    scrollable_frame,
-                    text=f"• {text}",
-                    font=("Arial", 10),
-                    bg="white",
-                    wraplength=850,
-                    justify=tk.LEFT
-                ).pack(anchor=tk.W, padx=(20 + indent, 20), pady=2)
-            
-            # Regular text  
-            else:
-                tk.Label(
-                    scrollable_frame,
-                    text=line_stripped,
-                    font=("Arial", 10),
-                    bg="white",
-                    wraplength=850,
-                    justify=tk.LEFT
-                ).pack(anchor=tk.W, padx=20, pady=3)
-        
-        # Close button
-        close_btn = tk.Button(
-            preview,
-            text="✕ Close",
-            command=preview.destroy,
-            bg="#e74c3c",
-            fg="white",
-            font=("Arial", 10)
-        )
-        close_btn.pack(pady=10)
 
 
 # ─────────────────────────────────────────────
@@ -1135,43 +792,57 @@ Extracts ALL PDF content:
   • Embedded files (referenced)
   • Security & permissions info
 
+Output (when -o/--extract-images not set):
+  Saved under project folder: converted/<pdf_name>/<pdf_name>.md
+  Images: converted/<pdf_name>/images/
+
 Examples:
-  python full_tool.py --gui
   python full_tool.py document.pdf
   python full_tool.py document.pdf -o output.md --extract-images ./images
   python full_tool.py document.pdf --password mypassword
         """
     )
-    parser.add_argument("pdf", nargs="?", help="PDF file to convert")
-    parser.add_argument("--gui", action="store_true", help="Launch GUI")
-    parser.add_argument("-o", "--output", help="Output Markdown file")
-    parser.add_argument("--extract-images", metavar="DIR", help="Extract images to folder")
+    parser.add_argument("pdf", help="PDF file to convert")
+    parser.add_argument("-o", "--output", help="Output Markdown file (default: project/converted/<name>/<name>.md)")
+    parser.add_argument("--extract-images", metavar="DIR", help="Extract images to folder (default: project/converted/<name>/images)")
     parser.add_argument("--password", help="PDF password (if encrypted)")
     
     args = parser.parse_args()
     
-    if args.gui:
-        root = tk.Tk()
-        app = ComprehensivePDFtoMDGUI(root)
-        root.mainloop()
-        return
-    
-    if not args.pdf:
-        parser.print_help()
-        sys.exit(1)
-    
     try:
-        output = args.output or Path(args.pdf).with_suffix(".md")
+        pdf_path = Path(args.pdf)
+        stem = pdf_path.stem
+
+        if args.output:
+            output = Path(args.output)
+        else:
+            # Save in project folder: converted/<doc_name>/<doc_name>.md
+            doc_dir = DEFAULT_OUTPUT_DIR / stem
+            doc_dir.mkdir(parents=True, exist_ok=True)
+            output = doc_dir / f"{stem}.md"
+
+        # Images: same folder as .md by default (converted/<doc_name>/images)
+        if args.extract_images is not None:
+            image_dir = args.extract_images
+        else:
+            image_dir = str(output.parent / "images")
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+
         print(f"\n🚀 Comprehensive PDF Converter")
         print("=" * 60)
-        
+        print(f"   Output: {output}")
+        if image_dir:
+            print(f"   Images: {image_dir}")
+        print()
+
         result = pdf_to_markdown(
             args.pdf,
             str(output),
-            args.extract_images,
+            image_dir,
             args.password
         )
-        
+
         print("\n✅ Conversion Complete!")
         print(f"   Total: {len(result)} characters")
         print(f"   Output: {output}")
