@@ -80,7 +80,7 @@ pip install pymupdf pillow pyyaml
 
 Or use requirements file:
 ```bash
-pip install -r requirements_full.txt
+pip install -r requirements.txt
 ```
 
 ### Step 2: Run the Tool

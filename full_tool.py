@@ -29,7 +29,6 @@ try:
 except ImportError:
     HAS_YAML = False
 from pathlib import Path
-from datetime import datetime
 
 try:
     import fitz  # PyMuPDF
@@ -526,9 +525,7 @@ def create_frontmatter(metadata: dict) -> str:
     frontmatter = {
         "title": metadata.get("title", "Untitled"),
         "author": metadata.get("author", "Unknown"),
-        "date": metadata.get("created", str(datetime.now())),
         "pages": metadata.get("pages", 0),
-        "encrypted": metadata.get("encrypted", False),
     }
     
     if metadata.get("subject"):
@@ -698,6 +695,23 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
             md_lines.append(content)
         
         prev_y = y_pos
+    
+    # Markdown collapses single newlines into spaces. Add two trailing spaces
+    # before newlines to create soft line breaks so each line renders separately.
+    for i in range(len(md_lines)):
+        line = md_lines[i]
+        if not line:
+            continue
+        if i + 1 >= len(md_lines):
+            continue
+        next_line = md_lines[i + 1]
+        if not next_line:
+            continue  # next is paragraph break, no soft break needed
+        stripped = line.strip()
+        # Skip soft breaks after tables, images, blockquotes
+        if stripped.startswith("|") or stripped.startswith("<") or stripped.startswith(">"):
+            continue
+        md_lines[i] = line.rstrip() + "  "
     
     return "\n".join(md_lines)
 
