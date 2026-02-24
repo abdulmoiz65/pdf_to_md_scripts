@@ -116,10 +116,14 @@ class TextFormatter:
     
     @staticmethod
     def apply_formatting(span: dict) -> str:
-        """Apply bold, italic, underline based on flags"""
+        """Apply bold, italic, underline based on flags. Skips empty/whitespace; strips before wrap."""
         text = span.get("text", "")
         flags = span.get("flags", 0)
         color = span.get("color")
+        
+        text = text.strip()
+        if not text:
+            return ""
         
         is_bold = bool(flags & 16)      # flag 16 = bold
         is_italic = bool(flags & 2)     # flag 2 = italic
@@ -201,23 +205,16 @@ class ImageExtractor:
             for img_idx, img_ref in enumerate(image_list):
                 try:
                     xref = img_ref[0]
-                    # Extract image
                     base_image = page.parent.extract_image(xref)
-                    
                     img_bytes = base_image["image"]
                     img_ext = base_image["ext"]
-                    
                     img_name = f"page{page_num}_img{img_idx}.{img_ext}"
                     img_path = Path(output_dir) / img_name
                     
-                    # Save image
                     with open(img_path, "wb") as f:
                         f.write(img_bytes)
-                    
-                    # Resize if needed
                     ImageExtractor.resize_image(str(img_path))
                     
-                    # Get position and dimensions (PDF points: 72 pt = 1 in)
                     img_rects = page.get_image_rects(xref)
                     if not img_rects:
                         continue
@@ -254,8 +251,8 @@ class TableExtractor:
     """Extract tables from PDF"""
     
     @staticmethod
-    def extract_all(page) -> list[tuple[str, float]]:
-        """Extract all tables from page"""
+    def extract_all(page) -> list[tuple[str, tuple]]:
+        """Extract all tables from page. Returns (markdown_table, bbox) where bbox=(x0,y0,x1,y1)."""
         tables = []
         
         try:
@@ -265,8 +262,7 @@ class TableExtractor:
                 try:
                     data = table_obj.extract()
                     md_table = TableExtractor.to_markdown(data)
-                    table_top = table_obj.bbox[1]
-                    tables.append((md_table, table_top))
+                    tables.append((md_table, tuple(table_obj.bbox)))
                 except Exception as e:
                     print(f"  [warn] Could not extract table {table_idx}: {e}")
         
@@ -551,7 +547,7 @@ def create_frontmatter(metadata: dict) -> str:
 
 
 def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
-    """Convert a single page to Markdown"""
+    """Convert a single page to Markdown."""
     md_lines = []
     
     avg_font_size = HeadingDetector.get_average_font_size(page)
@@ -569,6 +565,9 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     # Track which links we inlined as [display text](url) so we don't emit them again as standalone
     inlined_link_indices = set()
     
+    # Table bboxes: skip text blocks that overlap tables (avoid duplicating table content as raw text)
+    table_bboxes = [t[1] for t in tables]
+    
     # Track all elements by position for proper ordering
     elements = []  # (y_position, type, content)
     
@@ -576,7 +575,15 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     for block in blocks:
         if block["type"] != 0:  # skip non-text blocks
             continue
-        block_y = block.get("bbox", [0, 0, 0, 0])[1]
+        block_bbox = block.get("bbox", [0, 0, 0, 0])
+        try:
+            block_rect = (float(block_bbox[0]), float(block_bbox[1]), float(block_bbox[2]), float(block_bbox[3]))
+        except (IndexError, TypeError, ValueError):
+            block_rect = (0, 0, 0, 0)
+        # Skip blocks that overlap any table (avoids duplicating table content as raw text)
+        if any(_rect_overlap(block_rect, tb) for tb in table_bboxes):
+            continue
+        block_y = block_rect[1]
         
         for line in block.get("lines", []):
             line_spans = line.get("spans", [])
@@ -635,8 +642,8 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
             elements.append((block_y, "text", line_text, max_font_size, is_line_bold))
     
     # ---- 2) Add non-text elements ----
-    for table_md, table_y in tables:
-        elements.append((table_y, "table", table_md))
+    for table_md, table_bbox in tables:
+        elements.append((table_bbox[1], "table", table_md))
     
     for img_md, img_y in images:
         elements.append((img_y, "image", img_md))
@@ -678,7 +685,13 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
             elif ListDetector.is_numbered_item(content):
                 md_lines.append(content)
             elif heading:
-                md_lines.append(f"{heading}{content}")
+                # Strip redundant ** from heading content (heading already provides emphasis)
+                c = content.strip()
+                if len(c) > 4 and c.startswith("**") and c.endswith("**") and c.count("**") == 2:
+                    c = c[2:-2]
+                elif len(c) > 6 and c.startswith("***") and c.endswith("***"):
+                    c = c[3:-3]
+                md_lines.append(f"{heading}{c}")
             else:
                 md_lines.append(content)
         
@@ -835,7 +848,7 @@ Examples:
             doc_dir.mkdir(parents=True, exist_ok=True)
             output = doc_dir / f"{stem}.md"
 
-        # Images: same folder as .md by default (converted/<doc_name>/images)
+        # Images: same folder as .md by default
         if args.extract_images is not None:
             image_dir = args.extract_images
         else:
