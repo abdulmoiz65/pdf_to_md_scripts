@@ -92,7 +92,7 @@ class URLExtractor:
 class ListDetector:
     """Detect and format lists"""
     
-    BULLET_PATTERNS = [r"^[\•\-\*\·▪▸►→✓◆○●]\s+", r"^\s+[-•]\s+"]
+    BULLET_PATTERNS = [r"^[\•\-\*\·▪▸►→✓◆○●◦–—]\s+", r"^\s+[-•◦–]\s+"]
     NUMBERED_PATTERNS = [r"^\d{1,2}[\.\)]\s+", r"^[a-zA-Z][\.\)]\s+"]
     
     @staticmethod
@@ -108,7 +108,7 @@ class ListDetector:
     @staticmethod
     def normalize_bullet(text: str) -> str:
         """Normalize all bullets to '-'"""
-        return re.sub(r"^[\•\*\·▪▸►→✓◆○●]\s+", "- ", text)
+        return re.sub(r"^[\•\*\·▪▸►→✓◆○●◦–—]\s+", "- ", text)
 
 
 class TextFormatter:
@@ -399,6 +399,9 @@ class LinkExtractor:
         links = []
         try:
             for link in page.get_links():
+                # Skip internal goto links — handled by InternalLinkExtractor
+                if link.get("kind") == fitz.LINK_GOTO or ("page" in link and not link.get("uri")):
+                    continue
                 uri = link.get("uri") or link.get("file")
                 if not uri:
                     continue
@@ -414,6 +417,55 @@ class LinkExtractor:
         except Exception as e:
             print(f"  [warn] Could not extract links: {e}")
         return links
+
+
+class InternalLinkExtractor:
+    """Detect and convert internal PDF cross-reference (goto) links."""
+
+    @staticmethod
+    def slugify(text: str) -> str:
+        """Convert heading text to a Markdown-compatible anchor slug."""
+        slug = text.lower().strip()
+        slug = re.sub(r"[^\w\s-]", "", slug)
+        slug = re.sub(r"[\s_]+", "-", slug)
+        slug = slug.strip("-")
+        return slug
+
+    @staticmethod
+    def extract_with_rects(page) -> list[tuple[tuple, str, float]]:
+        """Return list of (rect, anchor, y_pos) for internal goto links.
+
+        anchor is a Markdown fragment like '#page-5'.
+        """
+        internal_links = []
+        try:
+            for link in page.get_links():
+                # Only handle internal goto links
+                kind = link.get("kind", -1)
+                if kind != fitz.LINK_GOTO:
+                    # Also catch links that have a 'page' key but no 'uri'
+                    if not ("page" in link and not link.get("uri")):
+                        continue
+
+                target_page = link.get("page")
+                if target_page is None:
+                    continue
+                # PyMuPDF pages are 0-indexed; convert to 1-indexed
+                target_page_1 = target_page + 1
+                anchor = f"#page-{target_page_1}"
+
+                rect = link.get("from")
+                if not rect:
+                    continue
+                try:
+                    r = (float(rect[0]), float(rect[1]), float(rect[2]), float(rect[3]))
+                except (IndexError, TypeError, ValueError):
+                    continue
+                y_pos = r[1]
+                internal_links.append((r, anchor, y_pos))
+        except Exception as e:
+            print(f"  [warn] Could not extract internal links: {e}")
+        return internal_links
 
 
 class BookmarkExtractor:
@@ -546,9 +598,88 @@ def create_frontmatter(metadata: dict) -> str:
     return f"---\n{yaml_str}---\n\n"
 
 
+# ── All bullet-like symbols recognised as list markers ──────────────
+_BULLET_CHARS = r"•\-\*·▪▸►→✓◆○●◦–—"
+
+# Lone bullet:  "•", "- •", "◦", "### ◦", "## -", "**•**", etc.
+_RE_LONE_BULLET = re.compile(
+    r"^(?:#{1,6}\s+)?"           # optional heading prefix  (### )
+    r"(?:\*{2,3})?"              # optional leading bold/bold-italic
+    r"(?:-\s*)?"                 # optional Markdown dash already present
+    r"[" + _BULLET_CHARS + r"]"  # the actual bullet character
+    r"(?:\*{2,3})?"              # optional trailing bold
+    r"\s*$"                      # nothing else on the line
+)
+
+# Lone numbered / lettered marker:  "1.", "**2.**", "### 3.", "a)", etc.
+_RE_LONE_NUMBER = re.compile(
+    r"^(?:#{1,6}\s+)?"           # optional heading prefix
+    r"(?:\*{2,3})?"              # optional leading bold
+    r"(?:\d{1,3}|[a-zA-Z])"     # the number or letter
+    r"[\.)\:]"                   # punctuation after (1. 2) a: etc.)
+    r"(?:\*{2,3})?"              # optional trailing bold
+    r"\s*$"                      # nothing else
+)
+
+
+def _merge_orphan_list_markers(lines: list[str]) -> list[str]:
+    """Merge orphaned bullet / numbered markers with the following non-empty line.
+
+    PDF extraction often puts '•' or '1.' on its own line with the actual
+    item text on the next line.  This pass stitches them together so the
+    output is valid Markdown list syntax.
+
+    Also handles heading-prefixed markers (### ◦) and bold-wrapped markers
+    (**1.**) that the converter may emit.
+    """
+    merged: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        is_lone_bullet = bool(_RE_LONE_BULLET.match(stripped))
+        is_lone_number = bool(_RE_LONE_NUMBER.match(stripped))
+
+        if (is_lone_bullet or is_lone_number) and i + 1 < len(lines):
+            # Find the next non-empty line to merge with
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+
+            if j < len(lines):
+                next_text = lines[j].strip()
+                leading_ws = line[: len(line) - len(line.lstrip())]
+
+                if is_lone_bullet:
+                    # Normalize every bullet variant to Markdown "- "
+                    merged.append(f"{leading_ws}- {next_text}")
+                else:
+                    # Extract the raw numeric/letter marker, stripping
+                    # heading hashes and bold asterisks
+                    raw = re.sub(r"^#{1,6}\s+", "", stripped)   # remove ### prefix
+                    raw = raw.replace("*", "")                  # remove bold
+                    marker = raw.rstrip()
+                    if not marker.endswith(" "):
+                        marker += " "
+                    merged.append(f"{leading_ws}{marker}{next_text}")
+
+                i = j + 1  # skip the consumed next line
+                continue
+
+        merged.append(line)
+        i += 1
+
+    return merged
+
+
 def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     """Convert a single page to Markdown."""
     md_lines = []
+
+    # Emit a page-level anchor so internal links and TOC entries resolve
+    md_lines.append(f'<a id="page-{page_num}"></a>')
+    md_lines.append("")
     
     avg_font_size = HeadingDetector.get_average_font_size(page)
     
@@ -556,7 +687,8 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     images = ImageExtractor.extract_all(page, page_num, image_dir) if image_dir else []
     tables = TableExtractor.extract_all(page)
     annotations = AnnotationExtractor.extract_all(page)
-    links_with_rects = LinkExtractor.extract_with_rects(page)  # (rect, uri, y_pos)
+    links_with_rects = LinkExtractor.extract_with_rects(page)       # (rect, uri, y_pos)
+    int_links_with_rects = InternalLinkExtractor.extract_with_rects(page)  # (rect, anchor, y_pos)
     
     # Get text content
     text_dict = page.get_text("dict")
@@ -564,6 +696,7 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     
     # Track which links we inlined as [display text](url) so we don't emit them again as standalone
     inlined_link_indices = set()
+    inlined_int_link_indices = set()
     
     # Table bboxes: skip text blocks that overlap tables (avoid duplicating table content as raw text)
     table_bboxes = [t[1] for t in tables]
@@ -620,7 +753,7 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
                 else:
                     span_bbox = (0, 0, 0, 0)
                 
-                # Does this span overlap a link? If yes, emit [display text](url)
+                # Does this span overlap an external link? If yes, emit [display text](url)
                 matched_link_idx = None
                 for idx, (link_rect, uri, _) in enumerate(links_with_rects):
                     if idx in inlined_link_indices:
@@ -629,9 +762,22 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
                         matched_link_idx = idx
                         break
                 
+                # Does this span overlap an internal goto link?
+                matched_int_idx = None
+                if matched_link_idx is None:
+                    for idx, (link_rect, anchor, _) in enumerate(int_links_with_rects):
+                        if idx in inlined_int_link_indices:
+                            continue
+                        if _rect_overlap(link_rect, span_bbox):
+                            matched_int_idx = idx
+                            break
+                
                 if matched_link_idx is not None and formatted.strip():
                     line_parts.append(f"[{formatted.strip()}]({links_with_rects[matched_link_idx][1]})")
                     inlined_link_indices.add(matched_link_idx)
+                elif matched_int_idx is not None and formatted.strip():
+                    line_parts.append(f"[{formatted.strip()}]({int_links_with_rects[matched_int_idx][1]})")
+                    inlined_int_link_indices.add(matched_int_idx)
                 else:
                     line_parts.append(formatted)
             
@@ -651,13 +797,22 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     for annot_md, annot_y in annotations:
         elements.append((annot_y, "annotation", annot_md))
     
-    # Only add links that were NOT inlined (no display text); skip duplicate URIs
+    # Only add external links that were NOT inlined (no display text); skip duplicate URIs
     inlined_uris = {links_with_rects[i][1] for i in inlined_link_indices}
     for idx, (_rect, uri, link_y) in enumerate(links_with_rects):
         if idx not in inlined_link_indices and uri not in inlined_uris:
             text = uri if len(uri) <= 60 else (uri[:57] + "...")
             elements.append((link_y, "link", f"[{text}]({uri})"))
             inlined_uris.add(uri)  # avoid duplicate standalone for same URL
+
+    # Add internal links that were NOT inlined; skip duplicate anchors
+    inlined_anchors = {int_links_with_rects[i][1] for i in inlined_int_link_indices}
+    for idx, (_rect, anchor, link_y) in enumerate(int_links_with_rects):
+        if idx not in inlined_int_link_indices and anchor not in inlined_anchors:
+            # Use a descriptive label like "Page N"
+            page_label = anchor.replace("#page-", "Page ")
+            elements.append((link_y, "link", f"[{page_label}]({anchor})"))
+            inlined_anchors.add(anchor)
     
     # Sort by position and process
     elements.sort(key=lambda x: x[0])
@@ -709,6 +864,9 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
         
         prev_y = y_pos
     
+    # ---- Post-process: merge orphaned bullet / numbered markers with next line ----
+    md_lines = _merge_orphan_list_markers(md_lines)
+
     # Markdown collapses single newlines into spaces. Add two trailing spaces
     # before newlines to create soft line breaks so each line renders separately.
     for i in range(len(md_lines)):
