@@ -44,6 +44,12 @@ except ImportError:
     Image = None
     HAS_PILLOW = False
 
+try:
+    import pymupdf4llm
+    HAS_PYMUPDF4LLM = True
+except ImportError:
+    HAS_PYMUPDF4LLM = False
+
 # Project folder: converted .md files and images go here by default
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "converted"
@@ -889,22 +895,65 @@ def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
 
 def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = None, 
                    password: str = None) -> str:
-    """Convert entire PDF to Markdown"""
-    
+    """Convert entire PDF to Markdown.
+
+    When pymupdf4llm is available, uses it for base extraction with automatic
+    image writing.  Falls back to the manual page-by-page pipeline otherwise.
+    """
+
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-    
+
     # Create image directory
     if image_dir:
         Path(image_dir).mkdir(parents=True, exist_ok=True)
-    
+
+    # ── pymupdf4llm path (preferred) ─────────────────────────────────
+    if HAS_PYMUPDF4LLM:
+        print(f"📄 Extracting with pymupdf4llm (write_images=True) ...")
+        try:
+            raw_md = pymupdf4llm.to_markdown(
+                str(pdf_path),
+                write_images=True,
+                image_path=image_dir or "images",
+                image_format="png",
+                dpi=150,
+            )
+        except Exception as e:
+            raise RuntimeError(f"pymupdf4llm extraction failed: {e}")
+
+        # ── Post-process: fix image paths to relative ────────────────
+        if image_dir:
+            # pymupdf4llm may embed absolute or deep-relative paths;
+            # normalise them to just "images/<file>"
+            abs_img = Path(image_dir).resolve().as_posix()
+            raw_md = raw_md.replace(abs_img + "/", "images/")
+            raw_md = raw_md.replace(abs_img.replace("/", "\\") + "\\", "images/")
+            # Also handle the un-resolved form
+            rel_img = str(Path(image_dir)).replace("\\", "/")
+            raw_md = raw_md.replace(rel_img + "/", "images/")
+
+        # ── Post-process: merge orphaned list markers ─────────────────
+        lines = raw_md.split("\n")
+        lines = _merge_orphan_list_markers(lines)
+        result = "\n".join(lines)
+
+        # Clean up excessive blank lines
+        result = re.sub(r"\n{3,}", "\n\n", result).strip()
+
+        if output_path:
+            Path(output_path).write_text(result, encoding="utf-8")
+            print(f"✅ Saved: {output_path}")
+
+        return result
+
+    # ── Fallback: manual page-by-page pipeline ───────────────────────
     md_content = []
-    
+
     try:
-        # Open PDF
         doc = fitz.open(pdf_path)
-        
+
         # Check encryption
         is_encrypted, enc_msg = SecurityHandler.check_encryption(doc)
         if is_encrypted:
@@ -913,14 +962,14 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
                     raise PermissionError("❌ Invalid password!")
             else:
                 raise PermissionError("❌ PDF is password-protected!")
-        
+
         # Extract metadata and create frontmatter
         metadata = PDFMetadataExtractor.extract(doc)
         md_content.append(create_frontmatter(metadata))
-        
+
         # Process pages
-        print(f"📄 Processing {len(doc)} pages...")
-        
+        print(f"📄 Processing {len(doc)} pages (manual fallback) ...")
+
         for page_num in range(len(doc)):
             try:
                 page = doc[page_num]
@@ -929,26 +978,26 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
                 print(f"  ✓ Page {page_num + 1}/{len(doc)}")
             except Exception as e:
                 print(f"  ⚠️  Error on page {page_num + 1}: {e}")
-        
+
         # Add embedded files info
         embedded = EmbeddedFileExtractor.extract(doc)
         if embedded:
             md_content.append(embedded)
-        
+
         doc.close()
-    
+
     except Exception as e:
         raise RuntimeError(f"Error processing PDF: {e}")
-    
+
     # Combine all content
     result = "\n\n".join(md_content)
     result = re.sub(r"\n{3,}", "\n\n", result).strip()
-    
+
     # Save if output path provided
     if output_path:
         Path(output_path).write_text(result, encoding="utf-8")
         print(f"✅ Saved: {output_path}")
-    
+
     return result
 
 
