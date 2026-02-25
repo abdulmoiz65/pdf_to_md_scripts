@@ -1,6 +1,22 @@
-# PDF to Markdown Converter - Full Tool
+# 📄 PDF to Markdown Converter
 
-A comprehensive PDF to Markdown converter that extracts **all 12 types** of content: text, headings, lists, hyperlinks, images, tables, graphics, annotations, bookmarks, metadata, embedded files, and security info.
+A single-file Python tool that converts PDF documents into clean, well-structured Markdown with images, tables, links, and formatting preserved.
+
+## ✨ Features
+
+- **Text & Formatting** — Bold, italic, underline preserved as Markdown
+- **Headings** — Auto-detected via font-size heuristics (H1–H3)
+- **Lists** — Bullets and numbered lists normalized to proper Markdown
+- **Hyperlinks** — External URLs and internal cross-references (`#page-N`)
+- **Images** — Extracted to a separate `images/` directory with relative paths
+- **Tables** — Converted to Markdown table syntax
+- **Annotations** — Comments and highlights included as blockquotes
+- **Bookmarks / TOC** — PDF outline converted to linked Table of Contents
+- **Metadata** — Title, author, pages emitted as YAML frontmatter
+- **Embedded Files** — Attached files listed with filenames and sizes
+- **Encryption** — Password-protected PDFs fully supported
+
+---
 
 ## 🚀 Quick Start
 
@@ -12,29 +28,97 @@ pip install -r requirements.txt
 
 ### Usage
 
-**Convert a PDF:**
 ```bash
-python full_tool.py document.pdf
+python pdf_to_md_converter.py pdfs/your_document.pdf
 ```
 
-**With custom output and images:**
+Output is saved to `converted/<pdf_name>/<pdf_name>.md` with images in `converted/<pdf_name>/images/`.
+
+### Other Options
+
 ```bash
-python full_tool.py document.pdf -o output.md --extract-images ./images
+# Password-protected PDF
+python pdf_to_md_converter.py pdfs/secure.pdf --password mypassword
+
+# Custom output path and image directory
+python pdf_to_md_converter.py pdfs/report.pdf -o output.md --extract-images ./my_images
 ```
 
-**Password-protected PDF:**
-```bash
-python full_tool.py secure.pdf --password mypassword
+---
+
+## 📁 Project Structure
+
+```
+tool/
+├── pdf_to_md_converter.py   # Main converter script
+├── requirements.txt          # Python dependencies
+├── README.md                 # This file
+├── converted/                # Default output directory (auto-created)
+│   └── <pdf_name>/
+│       ├── <pdf_name>.md     # Converted Markdown
+│       └── images/           # Extracted images
+└── pdfs/                     # Place your input PDFs here
 ```
 
-Output is saved under `converted/<pdf_name>/` by default.
+---
 
-## 📚 Documentation
+## ⚙️ CLI Reference
 
-See **[FULL_TOOL_GUIDE.md](FULL_TOOL_GUIDE.md)** for complete documentation.
+| Argument | Description |
+|---|---|
+| `pdf` | Path to the PDF file to convert |
+| `-o`, `--output` | Custom output Markdown file path |
+| `--extract-images DIR` | Custom directory for extracted images |
+| `--password` | Password for encrypted PDFs |
+
+---
 
 ## 📦 Dependencies
 
-- `pymupdf` - PDF processing
-- `Pillow` - Image extraction and resizing
-- `PyYAML` - Metadata frontmatter
+| Package | Purpose |
+|---|---|
+| `pymupdf` ≥ 1.23.0 | Core PDF parsing, text/table extraction, link detection |
+| `pymupdf4llm` | Image extraction, layout-aware Markdown generation |
+| `Pillow` ≥ 10.0.0 | Image resizing and optimization |
+| `PyYAML` ≥ 6.0 | YAML metadata frontmatter generation |
+
+Install all at once:
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 📝 Output Format
+
+The generated Markdown includes:
+
+```markdown
+---
+title: "Document Title"
+author: "Author Name"
+pages: 42
+---
+
+<a id="page-1"></a>
+
+# Document Title
+
+Body text with **bold**, *italic*, and [hyperlinks](https://example.com).
+
+- Bullet point one
+- Bullet point two
+
+| Column A | Column B |
+|----------|----------|
+| Cell 1   | Cell 2   |
+
+![](images/page1_img0.png)
+```
+
+---
+
+## 📄 License
+
+This project is provided as-is for internal use.

@@ -679,6 +679,112 @@ def _merge_orphan_list_markers(lines: list[str]) -> list[str]:
     return merged
 
 
+def _unwrap_code_block_bullets(text: str) -> str:
+    """Remove code fences that wrap list items.
+
+    pymupdf4llm sometimes wraps monospaced bullet / numbered text inside
+    ``` fenced blocks.  This detects such blocks and emits the content as
+    normal Markdown list items instead.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("```"):
+            block: list[str] = []
+            j = i + 1
+            while j < len(lines) and not lines[j].strip().startswith("```"):
+                block.append(lines[j])
+                j += 1
+            list_like = any(
+                ListDetector.is_bullet_item(l.strip()) or ListDetector.is_numbered_item(l.strip())
+                for l in block if l.strip()
+            )
+            if list_like and block:
+                for bl in block:
+                    s = bl.strip()
+                    if not s:
+                        out.append("")
+                    elif ListDetector.is_bullet_item(s):
+                        out.append(ListDetector.normalize_bullet(s))
+                    else:
+                        out.append(s)
+                i = j + 1 if j < len(lines) else j
+                continue
+            out.append(lines[i])
+            i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def _inject_internal_links(page_chunks: list, pdf_path, password: str = None) -> str:
+    """Join per-page markdown chunks with page anchors and inject inline links.
+
+    *page_chunks* comes from ``pymupdf4llm.to_markdown(page_chunks=True)``.
+    Each element is a dict with at least a ``"text"`` key.
+
+    1. Joins chunks, inserting ``<a id="page-N"></a>`` before each page.
+    2. Opens the PDF with fitz and converts plain text that overlaps link
+       rects into ``[text](url)`` / ``[text](#page-N)`` Markdown links.
+
+    Does NOT add a TOC or frontmatter.
+    Does NOT alter images or their positions.
+    """
+    # ── 1) Assemble pages with anchors ────────────────────────────────
+    parts: list[str] = []
+    for idx, chunk in enumerate(page_chunks):
+        page_num = idx + 1  # 1-indexed
+        parts.append(f'<a id="page-{page_num}"></a>')
+        parts.append("")  # blank line after anchor
+        text = chunk["text"] if isinstance(chunk, dict) else str(chunk)
+        parts.append(text.rstrip())
+        parts.append("")  # blank line between pages
+    md_text = "\n".join(parts)
+
+    # ── 2) Inline links (external + internal) ─────────────────────────
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"  [warn] Could not open PDF for link injection: {e}")
+        return md_text
+
+    if password and doc.is_encrypted and doc.needs_pass:
+        doc.authenticate(password)
+
+    link_replacements: list[tuple[str, str]] = []
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        for rect, uri, _ in LinkExtractor.extract_with_rects(page):
+            try:
+                link_text = page.get_text("text", clip=fitz.Rect(rect)).strip()
+            except Exception:
+                link_text = ""
+            link_text = re.sub(r"\s+", " ", link_text).strip()
+            if link_text and len(link_text) >= 2:
+                link_replacements.append((link_text, f"[{link_text}]({uri})"))
+        for rect, anchor, _ in InternalLinkExtractor.extract_with_rects(page):
+            try:
+                link_text = page.get_text("text", clip=fitz.Rect(rect)).strip()
+            except Exception:
+                link_text = ""
+            link_text = re.sub(r"\s+", " ", link_text).strip()
+            if link_text and len(link_text) >= 2:
+                link_replacements.append((link_text, f"[{link_text}]({anchor})"))
+
+    # Longest first to avoid partial matches
+    link_replacements.sort(key=lambda x: len(x[0]), reverse=True)
+    for plain, md_link in link_replacements:
+        escaped = re.escape(plain)
+        pattern = r"(?<!\[)" + escaped + r"(?!\]\()"
+        md_text = re.sub(pattern, md_link, md_text, count=1)
+
+    doc.close()
+    return md_text
+
+
 def page_to_markdown(page, page_num: int, image_dir: str = None) -> str:
     """Convert a single page to Markdown."""
     md_lines = []
@@ -911,33 +1017,60 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
 
     # ── pymupdf4llm path (preferred) ─────────────────────────────────
     if HAS_PYMUPDF4LLM:
-        print(f"📄 Extracting with pymupdf4llm (write_images=True) ...")
+        print(f"📄 Extracting with pymupdf4llm (page_chunks + write_images) ...")
         try:
-            raw_md = pymupdf4llm.to_markdown(
-                str(pdf_path),
+            # Pre-open and authenticate so pymupdf4llm gets a decrypted doc
+            doc = fitz.open(str(pdf_path))
+            if doc.is_encrypted:
+                if password:
+                    if not doc.authenticate(password):
+                        raise PermissionError("❌ Invalid password!")
+                else:
+                    raise PermissionError("❌ PDF is password-protected!")
+            chunks = pymupdf4llm.to_markdown(
+                doc,
                 write_images=True,
                 image_path=image_dir or "images",
                 image_format="png",
                 dpi=150,
+                page_chunks=True,
             )
+            doc.close()
+        except (PermissionError,):
+            raise
         except Exception as e:
             raise RuntimeError(f"pymupdf4llm extraction failed: {e}")
 
-        # ── Post-process: fix image paths to relative ────────────────
+        # ── Post-process each chunk: fix image paths ─────────────────
         if image_dir:
-            # pymupdf4llm may embed absolute or deep-relative paths;
-            # normalise them to just "images/<file>"
             abs_img = Path(image_dir).resolve().as_posix()
-            raw_md = raw_md.replace(abs_img + "/", "images/")
-            raw_md = raw_md.replace(abs_img.replace("/", "\\") + "\\", "images/")
-            # Also handle the un-resolved form
             rel_img = str(Path(image_dir)).replace("\\", "/")
-            raw_md = raw_md.replace(rel_img + "/", "images/")
+            for chunk in chunks:
+                t = chunk["text"]
+                t = t.replace(abs_img + "/", "images/")
+                t = t.replace(abs_img.replace("/", "\\") + "\\", "images/")
+                t = t.replace(rel_img + "/", "images/")
+                chunk["text"] = t
 
-        # ── Post-process: merge orphaned list markers ─────────────────
-        lines = raw_md.split("\n")
-        lines = _merge_orphan_list_markers(lines)
-        result = "\n".join(lines)
+        # ── Post-process each chunk: unwrap code-block bullets ────────
+        for chunk in chunks:
+            chunk["text"] = _unwrap_code_block_bullets(chunk["text"])
+
+        # ── Post-process each chunk: merge orphaned list markers ──────
+        for chunk in chunks:
+            lines = chunk["text"].split("\n")
+            lines = _merge_orphan_list_markers(lines)
+            chunk["text"] = "\n".join(lines)
+
+        # ── Assemble pages with anchors + inject links ────────────────
+        result = _inject_internal_links(chunks, str(pdf_path), password)
+
+        # ── Post-process: merge orphaned bullets in table cells ─────────
+        # pymupdf4llm puts bullet chars (•, ◦, ▪, ‣) on their own <br>
+        # segment inside table cells.  Merge them with the following text.
+        result = re.sub(r'([•◦▪‣])\s*<br>\s*(?!<br>)', r'\1 ', result)
+        # Also fix " <br>•<br>" → "<br>• " (blank segment before bullet)
+        result = re.sub(r'<br>\s*([•◦▪‣])\s*<br>\s*(?!<br>)', r'<br>\1 ', result)
 
         # Clean up excessive blank lines
         result = re.sub(r"\n{3,}", "\n\n", result).strip()
@@ -1031,9 +1164,9 @@ Output (when -o/--extract-images not set):
   Images: converted/<pdf_name>/images/
 
 Examples:
-  python full_tool.py document.pdf
-  python full_tool.py document.pdf -o output.md --extract-images ./images
-  python full_tool.py document.pdf --password mypassword
+  python pdf_to_md_converter.py document.pdf
+  python pdf_to_md_converter.py document.pdf -o output.md --extract-images ./images
+  python pdf_to_md_converter.py document.pdf --password mypassword
         """
     )
     parser.add_argument("pdf", help="PDF file to convert")
