@@ -1040,18 +1040,37 @@ def pdf_to_markdown(pdf_path: str, output_path: str = None, image_dir: str = Non
             raise RuntimeError(f"pymupdf4llm extraction failed: {exc}")
 
         # ── Post-process each chunk ───────────────────────────────────
+        # Normalize image paths so they are relative to the output .md file (for correct display)
         if image_dir:
-            abs_img = Path(image_dir).resolve().as_posix()
+            out_dir = Path(output_path).resolve().parent if output_path else Path(image_dir).resolve().parent
+            img_dir_resolved = Path(image_dir).resolve()
+            try:
+                rel_prefix = img_dir_resolved.relative_to(out_dir)
+                md_image_prefix = str(rel_prefix).replace("\\", "/") + "/"
+            except ValueError:
+                md_image_prefix = "images/"
+            # Path variants pymupdf4llm may emit (absolute/relative, forward/back slash)
+            abs_posix = img_dir_resolved.as_posix()
+            abs_win = str(img_dir_resolved)
             rel_img = str(Path(image_dir)).replace("\\", "/")
+            rel_img_win = str(Path(image_dir))
+            prefixes_to_replace = [
+                abs_posix + "/",
+                abs_posix + "\\",
+                abs_win + "\\",
+                abs_win + "/",
+                rel_img + "/",
+                rel_img_win + "\\",
+                rel_img_win + "/",
+            ]
 
         for chunk in chunks:
             chunk_text = chunk["text"]
 
-            # Fix image paths to use relative 'images/' prefix
+            # Fix image paths: use path relative to output .md so images display correctly
             if image_dir:
-                chunk_text = chunk_text.replace(abs_img + "/", "images/")
-                chunk_text = chunk_text.replace(abs_img.replace("/", "\\") + "\\", "images/")
-                chunk_text = chunk_text.replace(rel_img + "/", "images/")
+                for prefix in prefixes_to_replace:
+                    chunk_text = chunk_text.replace(prefix, md_image_prefix)
 
             # Unwrap code-block bullets
             chunk_text = _unwrap_code_block_bullets(chunk_text)
